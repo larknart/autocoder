@@ -6,10 +6,18 @@ Core agent interaction functions for running autonomous coding sessions.
 """
 
 import asyncio
+import io
+import sys
 from pathlib import Path
 from typing import Optional
 
 from claude_agent_sdk import ClaudeSDKClient
+
+# Fix Windows console encoding for Unicode characters (emoji, etc.)
+# Without this, print() crashes when Claude outputs emoji like ✅
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 from client import create_client
 from progress import print_session_header, print_progress_summary, has_features
