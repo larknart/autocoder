@@ -98,15 +98,13 @@ npm run lint     # Run ESLint
 
 ### Project Registry
 
-Projects can be stored in any directory. The registry (`projects.json`) maps project names to paths:
-- **Windows**: `%APPDATA%\autonomous-coder\projects.json`
-- **macOS**: `~/Library/Application Support/autonomous-coder/projects.json`
-- **Linux**: `~/.config/autonomous-coder/projects.json`
+Projects can be stored in any directory. The registry maps project names to paths using SQLite:
+- **All platforms**: `~/.autocoder/registry.db`
 
 The registry uses:
+- SQLite database with SQLAlchemy ORM
 - POSIX path format (forward slashes) for cross-platform compatibility
-- File locking for concurrent access safety
-- Atomic writes (temp file + rename) to prevent corruption
+- SQLite's built-in transaction handling for concurrency safety
 
 ### Server API (server/)
 
@@ -146,7 +144,7 @@ MCP tools available to the agent:
 
 ### Project Structure for Generated Apps
 
-Projects can be stored in any directory (registered in `projects.json`). Each project contains:
+Projects can be stored in any directory (registered in `~/.autocoder/registry.db`). Each project contains:
 - `prompts/app_spec.txt` - Application specification (XML format)
 - `prompts/initializer_prompt.md` - First session prompt
 - `prompts/coding_prompt.md` - Continuation session prompt

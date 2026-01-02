@@ -3,20 +3,20 @@ Project Registry Module
 =======================
 
 Cross-platform project registry for storing project name to path mappings.
-Supports Windows, macOS, and Linux with platform-specific config directories.
+Uses SQLite database stored at ~/.autocoder/registry.db.
 """
 
-import json
 import logging
 import os
-import stat
-import sys
-import tempfile
-import shutil
-import time
+import re
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from sqlalchemy import Column, String, DateTime, create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
 
 # Module logger
 logger = logging.getLogger(__name__)
@@ -37,7 +37,7 @@ class RegistryNotFound(RegistryError):
 
 
 class RegistryCorrupted(RegistryError):
-    """Registry JSON is malformed."""
+    """Registry database is corrupted."""
     pass
 
 
@@ -47,225 +47,85 @@ class RegistryPermissionDenied(RegistryError):
 
 
 # =============================================================================
-# Registry Lock (Cross-Platform)
+# SQLAlchemy Model
 # =============================================================================
 
-class RegistryLock:
-    """
-    Context manager for registry file locking.
-    Uses fcntl on Unix and msvcrt on Windows.
-    """
+Base = declarative_base()
 
-    def __init__(self, registry_path: Path):
-        self.registry_path = registry_path
-        self.lock_path = registry_path.with_suffix('.lock')
-        self._file = None
 
-    def __enter__(self):
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = open(self.lock_path, 'w')
+class Project(Base):
+    """SQLAlchemy model for registered projects."""
+    __tablename__ = "projects"
 
-        try:
-            if sys.platform == "win32":
-                import msvcrt
-                # Windows: msvcrt.LK_NBLCK is non-blocking, so we retry with backoff
-                max_attempts = 10
-                for attempt in range(max_attempts):
-                    try:
-                        msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
-                        break  # Lock acquired
-                    except OSError:
-                        if attempt == max_attempts - 1:
-                            raise  # Give up after max attempts
-                        time.sleep(0.1 * (attempt + 1))  # Exponential backoff
-            else:
-                import fcntl
-                fcntl.flock(self._file.fileno(), fcntl.LOCK_EX)
-        except Exception as e:
-            self._file.close()
-            raise RegistryError(f"Could not acquire registry lock: {e}") from e
-
-        return self
-
-    def __exit__(self, *args):
-        if self._file:
-            try:
-                if sys.platform != "win32":
-                    import fcntl
-                    fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
-            finally:
-                self._file.close()
-                try:
-                    self.lock_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
+    name = Column(String(50), primary_key=True, index=True)
+    path = Column(String, nullable=False)  # POSIX format for cross-platform
+    created_at = Column(DateTime, nullable=False)
 
 
 # =============================================================================
-# Registry Path Functions
+# Database Connection
 # =============================================================================
+
+# Module-level singleton for database engine
+_engine = None
+_SessionLocal = None
+
 
 def get_config_dir() -> Path:
     """
-    Get the platform-specific config directory for the application.
+    Get the config directory: ~/.autocoder/
 
     Returns:
-        - Windows: %APPDATA%/autonomous-coder/
-        - macOS: ~/Library/Application Support/autonomous-coder/
-        - Linux: ~/.config/autonomous-coder/ (or $XDG_CONFIG_HOME)
+        Path to ~/.autocoder/ (created if it doesn't exist)
     """
-    if sys.platform == "win32":
-        base = Path(os.getenv("APPDATA", Path.home() / "AppData" / "Roaming"))
-    elif sys.platform == "darwin":
-        base = Path.home() / "Library" / "Application Support"
-    else:  # Linux and other Unix-like
-        base = Path(os.getenv("XDG_CONFIG_HOME", Path.home() / ".config"))
-
-    config_dir = base / "autonomous-coder"
+    config_dir = Path.home() / ".autocoder"
     config_dir.mkdir(parents=True, exist_ok=True)
     return config_dir
 
 
 def get_registry_path() -> Path:
-    """Get the path to the projects registry file."""
-    return get_config_dir() / "projects.json"
+    """Get the path to the registry database."""
+    return get_config_dir() / "registry.db"
 
 
-# =============================================================================
-# Registry I/O Functions
-# =============================================================================
-
-def _create_empty_registry() -> dict[str, Any]:
-    """Create a new empty registry structure."""
-    return {
-        "version": 1,
-        "created_at": datetime.now().isoformat(),
-        "projects": {}
-    }
-
-
-def load_registry(create_if_missing: bool = True) -> dict[str, Any]:
+def _get_engine():
     """
-    Load the registry from disk.
-
-    Args:
-        create_if_missing: If True, create a new registry if none exists.
+    Get or create the database engine (singleton pattern).
 
     Returns:
-        The registry dictionary.
-
-    Raises:
-        RegistryNotFound: If registry doesn't exist and create_if_missing is False.
-        RegistryCorrupted: If registry JSON is malformed.
-        RegistryPermissionDenied: If can't read the registry file.
+        Tuple of (engine, SessionLocal)
     """
-    registry_path = get_registry_path()
+    global _engine, _SessionLocal
 
-    # Case 1: File doesn't exist
-    if not registry_path.exists():
-        if create_if_missing:
-            registry = _create_empty_registry()
-            save_registry(registry)
-            return registry
-        else:
-            raise RegistryNotFound(f"Registry not found: {registry_path}")
+    if _engine is None:
+        db_path = get_registry_path()
+        db_url = f"sqlite:///{db_path.as_posix()}"
+        _engine = create_engine(db_url, connect_args={"check_same_thread": False})
+        Base.metadata.create_all(bind=_engine)
+        _SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
+        logger.debug("Initialized registry database at: %s", db_path)
 
-    # Case 2: Read the file
-    try:
-        content = registry_path.read_text(encoding='utf-8')
-    except PermissionError as e:
-        raise RegistryPermissionDenied(f"Cannot read registry: {e}") from e
-    except OSError as e:
-        raise RegistryError(f"Error reading registry: {e}") from e
-
-    # Case 3: Parse JSON
-    try:
-        data = json.loads(content)
-    except json.JSONDecodeError as e:
-        # Try to recover from backup
-        backup_path = registry_path.with_suffix('.json.backup')
-        logger.warning("Registry corrupted, attempting recovery from backup: %s", backup_path)
-        if backup_path.exists():
-            try:
-                backup_content = backup_path.read_text(encoding='utf-8')
-                data = json.loads(backup_content)
-                # Restore from backup
-                shutil.copy2(backup_path, registry_path)
-                logger.info("Successfully recovered registry from backup")
-                return data
-            except Exception as recovery_error:
-                logger.error("Failed to recover from backup: %s", recovery_error)
-        raise RegistryCorrupted(
-            f"Registry corrupted: {e}\nBackup location: {backup_path}"
-        ) from e
-
-    # Ensure required structure
-    if "projects" not in data:
-        data["projects"] = {}
-    if "version" not in data:
-        data["version"] = 1
-
-    return data
+    return _engine, _SessionLocal
 
 
-def save_registry(registry: dict[str, Any]) -> None:
+@contextmanager
+def _get_session():
     """
-    Save the registry to disk atomically.
+    Context manager for database sessions with automatic commit/rollback.
 
-    Uses temp file + rename for atomic writes to prevent corruption.
-
-    Args:
-        registry: The registry dictionary to save.
-
-    Raises:
-        RegistryPermissionDenied: If can't write to the registry.
-        RegistryError: If write fails for other reasons.
+    Yields:
+        SQLAlchemy session
     """
-    registry_path = get_registry_path()
-    registry_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Create backup before modification (if file exists)
-    if registry_path.exists():
-        backup_path = registry_path.with_suffix('.json.backup')
-        try:
-            shutil.copy2(registry_path, backup_path)
-        except Exception as e:
-            logger.warning("Failed to create registry backup: %s", e)
-
-    # Write to temp file in same directory (ensures same filesystem for atomic rename)
-    # On Windows, we must close the file before renaming it
-    tmp_path = None
+    _, SessionLocal = _get_engine()
+    session = SessionLocal()
     try:
-        # Create temp file
-        fd, tmp_name = tempfile.mkstemp(suffix='.json', dir=registry_path.parent)
-        tmp_path = Path(tmp_name)
-
-        try:
-            # Write content
-            with os.fdopen(fd, 'w', encoding='utf-8') as tmp_file:
-                json.dump(registry, tmp_file, indent=2)
-                tmp_file.flush()
-                os.fsync(tmp_file.fileno())
-            # File is now closed, safe to rename on Windows
-
-            # Atomic rename
-            tmp_path.replace(registry_path)
-
-            # Set restrictive permissions (owner read/write only)
-            # On Windows, this is a best-effort operation
-            try:
-                if sys.platform != "win32":
-                    registry_path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0o600
-            except Exception:
-                pass  # Best effort - don't fail if permissions can't be set
-        except Exception:
-            if tmp_path and tmp_path.exists():
-                tmp_path.unlink(missing_ok=True)
-            raise
-    except PermissionError as e:
-        raise RegistryPermissionDenied(f"Cannot write registry: {e}") from e
-    except OSError as e:
-        raise RegistryError(f"Failed to write registry: {e}") from e
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 
 # =============================================================================
@@ -285,7 +145,6 @@ def register_project(name: str, path: Path) -> None:
         RegistryError: If a project with that name already exists.
     """
     # Validate name
-    import re
     if not re.match(r'^[a-zA-Z0-9_-]{1,50}$', name):
         raise ValueError(
             "Invalid project name. Use only letters, numbers, hyphens, "
@@ -295,21 +154,20 @@ def register_project(name: str, path: Path) -> None:
     # Ensure path is absolute
     path = Path(path).resolve()
 
-    with RegistryLock(get_registry_path()):
-        registry = load_registry()
-
-        if name in registry["projects"]:
+    with _get_session() as session:
+        existing = session.query(Project).filter(Project.name == name).first()
+        if existing:
             logger.warning("Attempted to register duplicate project: %s", name)
             raise RegistryError(f"Project '{name}' already exists in registry")
 
-        # Store path as POSIX format (forward slashes) for cross-platform consistency
-        registry["projects"][name] = {
-            "path": path.as_posix(),
-            "created_at": datetime.now().isoformat()
-        }
+        project = Project(
+            name=name,
+            path=path.as_posix(),
+            created_at=datetime.now()
+        )
+        session.add(project)
 
-        save_registry(registry)
-        logger.info("Registered project '%s' at path: %s", name, path)
+    logger.info("Registered project '%s' at path: %s", name, path)
 
 
 def unregister_project(name: str) -> bool:
@@ -322,17 +180,16 @@ def unregister_project(name: str) -> bool:
     Returns:
         True if removed, False if project wasn't found.
     """
-    with RegistryLock(get_registry_path()):
-        registry = load_registry()
-
-        if name not in registry["projects"]:
+    with _get_session() as session:
+        project = session.query(Project).filter(Project.name == name).first()
+        if not project:
             logger.debug("Attempted to unregister non-existent project: %s", name)
             return False
 
-        del registry["projects"][name]
-        save_registry(registry)
-        logger.info("Unregistered project: %s", name)
-        return True
+        session.delete(project)
+
+    logger.info("Unregistered project: %s", name)
+    return True
 
 
 def get_project_path(name: str) -> Path | None:
@@ -345,14 +202,15 @@ def get_project_path(name: str) -> Path | None:
     Returns:
         The project Path, or None if not found.
     """
-    registry = load_registry()
-    project = registry["projects"].get(name)
-
-    if project is None:
-        return None
-
-    # Convert POSIX path string back to Path object
-    return Path(project["path"])
+    _, SessionLocal = _get_engine()
+    session = SessionLocal()
+    try:
+        project = session.query(Project).filter(Project.name == name).first()
+        if project is None:
+            return None
+        return Path(project.path)
+    finally:
+        session.close()
 
 
 def list_registered_projects() -> dict[str, dict[str, Any]]:
@@ -362,8 +220,19 @@ def list_registered_projects() -> dict[str, dict[str, Any]]:
     Returns:
         Dictionary mapping project names to their info dictionaries.
     """
-    registry = load_registry()
-    return registry.get("projects", {})
+    _, SessionLocal = _get_engine()
+    session = SessionLocal()
+    try:
+        projects = session.query(Project).all()
+        return {
+            p.name: {
+                "path": p.path,
+                "created_at": p.created_at.isoformat() if p.created_at else None
+            }
+            for p in projects
+        }
+    finally:
+        session.close()
 
 
 def get_project_info(name: str) -> dict[str, Any] | None:
@@ -376,8 +245,18 @@ def get_project_info(name: str) -> dict[str, Any] | None:
     Returns:
         Project info dictionary, or None if not found.
     """
-    registry = load_registry()
-    return registry["projects"].get(name)
+    _, SessionLocal = _get_engine()
+    session = SessionLocal()
+    try:
+        project = session.query(Project).filter(Project.name == name).first()
+        if project is None:
+            return None
+        return {
+            "path": project.path,
+            "created_at": project.created_at.isoformat() if project.created_at else None
+        }
+    finally:
+        session.close()
 
 
 def update_project_path(name: str, new_path: Path) -> bool:
@@ -393,15 +272,14 @@ def update_project_path(name: str, new_path: Path) -> bool:
     """
     new_path = Path(new_path).resolve()
 
-    with RegistryLock(get_registry_path()):
-        registry = load_registry()
-
-        if name not in registry["projects"]:
+    with _get_session() as session:
+        project = session.query(Project).filter(Project.name == name).first()
+        if not project:
             return False
 
-        registry["projects"][name]["path"] = new_path.as_posix()
-        save_registry(registry)
-        return True
+        project.path = new_path.as_posix()
+
+    return True
 
 
 # =============================================================================
@@ -448,22 +326,16 @@ def cleanup_stale_projects() -> list[str]:
     """
     removed = []
 
-    with RegistryLock(get_registry_path()):
-        registry = load_registry()
-        projects = registry.get("projects", {})
-
-        stale_names = []
-        for name, info in projects.items():
-            path = Path(info["path"])
+    with _get_session() as session:
+        projects = session.query(Project).all()
+        for project in projects:
+            path = Path(project.path)
             if not path.exists():
-                stale_names.append(name)
+                session.delete(project)
+                removed.append(project.name)
 
-        for name in stale_names:
-            del projects[name]
-            removed.append(name)
-
-        if removed:
-            save_registry(registry)
+    if removed:
+        logger.info("Cleaned up stale projects: %s", removed)
 
     return removed
 
@@ -475,18 +347,20 @@ def list_valid_projects() -> list[dict[str, Any]]:
     Returns:
         List of project info dicts with additional 'name' field.
     """
-    registry = load_registry()
-    projects = registry.get("projects", {})
-
-    valid = []
-    for name, info in projects.items():
-        path = Path(info["path"])
-        is_valid, _ = validate_project_path(path)
-        if is_valid:
-            valid.append({
-                "name": name,
-                "path": info["path"],
-                "created_at": info.get("created_at")
-            })
-
-    return valid
+    _, SessionLocal = _get_engine()
+    session = SessionLocal()
+    try:
+        projects = session.query(Project).all()
+        valid = []
+        for p in projects:
+            path = Path(p.path)
+            is_valid, _ = validate_project_path(path)
+            if is_valid:
+                valid.append({
+                    "name": p.name,
+                    "path": p.path,
+                    "created_at": p.created_at.isoformat() if p.created_at else None
+                })
+        return valid
+    finally:
+        session.close()
